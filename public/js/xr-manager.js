@@ -47,6 +47,8 @@ export class XRPlaneSession {
     /** @type {XRReferenceSpace | null} */
     this.refSpace = null;
     this.refSpaceType = /** @type {'local-floor'|'local'} */ ('local');
+    /** 直前フレームでトラッキングを失っていたか（変化したときだけ onTracking を呼ぶため） */
+    this.trackingLost = false;
   }
 
   get planeCount() {
@@ -57,18 +59,76 @@ export class XRPlaneSession {
    * AR セッションを開始し、描画ループを登録する。失敗時は例外を投げる（呼び出し側で IDLE に戻す）。
    */
   async start() {
-    // TODO(M1):
-    // 1. navigator.xr.requestSession('immersive-ar', {
-    //      requiredFeatures: ['plane-detection'],
-    //      optionalFeatures: ['local-floor', 'dom-overlay'],
-    //      domOverlay: { root: this.overlayRoot } })
-    // 2. renderer.xr.setReferenceSpaceType('local-floor') を試し、
-    //    session.requestReferenceSpace('local-floor') が失敗したら 'local' にフォールバック
-    // 3. await renderer.xr.setSession(session)
-    //    this.refSpace = renderer.xr.getReferenceSpace()
-    // 4. session.addEventListener('end', () => this.#handleEnd())
-    // 5. renderer.setAnimationLoop((t, frame) => this.#onXRFrame(t, frame))
-    throw new Error('XRPlaneSession.start() は未実装です（M1）');
+    // ---- 1. セッション要求 ----
+    // requiredFeatures：1つでも使えなければ requestSession 自体が失敗する（NotSupportedError）。
+    //   このアプリは平面検出がないと意味がないので 'plane-detection' は必須。
+    // optionalFeatures：使えなくてもセッションは始まる。実際に有効になったかは
+    //   session.enabledFeatures で後から確認できる。
+    // この呼び出しはユーザー操作（ボタンのクリック）の中でしか許可されない点にも注意。
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['plane-detection'],
+      optionalFeatures: ['local-floor', 'dom-overlay'],
+      domOverlay: { root: this.overlayRoot },
+    });
+
+    try {
+      // ---- 2. 参照空間の種類を決める ----
+      // 'local-floor'：原点が床の高さ（Y=0 が床）。プレビューや書き出しで扱いやすい。
+      // 'local'      ：原点はセッション開始時の端末の位置。Y=0 は床にならない。
+      // three.js の setSession() は内部で requestReferenceSpace(type) を1回呼ぶだけで、
+      // 失敗してもフォールバックしない。だから先にここで自分で試して、取れる方を選んでおく。
+      this.refSpaceType = await this.#pickReferenceSpaceType(session);
+      // setReferenceSpaceType() は setSession() より前に呼ぶ必要がある（XR 中は変更できない）
+      this.renderer.xr.setReferenceSpaceType(this.refSpaceType);
+
+      // ---- 3. three.js にセッションを渡す ----
+      // ここで three.js が XRWebGLLayer を作って描画先を XR に切り替え、参照空間を取得する。
+      // 以後、renderer.render() はカメラ姿勢・投影行列を XR から受け取って描画する。
+      await this.renderer.xr.setSession(session);
+      this.refSpace = this.renderer.xr.getReferenceSpace();
+    } catch (err) {
+      // セッションは作れたのに準備に失敗した場合、開きっぱなしにしないよう閉じてから例外を伝える。
+      // （'end' リスナーはまだ付けていないので #handleEnd は走らない。後始末は main.js の catch に任せる）
+      await session.end().catch(() => {});
+      throw err;
+    }
+    this.session = session;
+
+    // 学習用ログ：実際に何が有効になったか（chrome://inspect で確認）
+    console.info('[XR] session started', {
+      referenceSpace: this.refSpaceType,
+      enabledFeatures: session.enabledFeatures ? [...session.enabledFeatures] : '(未対応ブラウザ)',
+      domOverlay: session.domOverlayState?.type ?? '(なし)',
+    });
+    if (this.refSpaceType === 'local') {
+      // TODO(M4): HUD に「床の高さが不明（Y=0 は開始時の端末の高さ）」と表示する
+      console.warn('[XR] local-floor が使えないため local で開始。Y=0 は床ではありません');
+    }
+
+    // ---- 4. 終了イベント ----
+    // 完了ボタン（finish → session.end()）でも、Quest のシステムUIから抜けても、
+    // 必ずこの 'end' が発火する。終了処理はこの1経路に集約する。
+    session.addEventListener('end', () => this.#handleEnd(), { once: true });
+
+    // ---- 5. 描画ループ ----
+    // XR 中は window.requestAnimationFrame ではなく session.requestAnimationFrame で回す必要がある。
+    // renderer.setAnimationLoop() は XR 中なら自動でそちらに切り替え、第2引数に XRFrame を渡してくれる。
+    this.renderer.setAnimationLoop((t, frame) => this.#onXRFrame(t, frame));
+  }
+
+  /**
+   * 'local-floor' が取れるか試し、だめなら 'local' を返す。
+   * 取得した参照空間はここでは使わず捨てる（three.js が setSession 内で改めて取得する）。
+   * @param {XRSession} session
+   * @returns {Promise<'local-floor'|'local'>}
+   */
+  async #pickReferenceSpaceType(session) {
+    try {
+      await session.requestReferenceSpace('local-floor');
+      return 'local-floor';
+    } catch {
+      return 'local'; // 'local' は immersive セッションなら必ず使える
+    }
   }
 
   /** カメラ映像を隠す（カメラ追従の不透明裏面球を表示）。§5.5 */
@@ -92,18 +152,84 @@ export class XRPlaneSession {
 
   /** @param {number} time @param {XRFrame} frame */
   #onXRFrame(time, frame) {
-    // TODO(M1): §5.3 の表どおり
-    // - viewerPose = frame.getViewerPose(this.refSpace) → null なら onTracking(true)（変化時のみ）
-    // - detected = frame.detectedPlanes ?? new Set()
-    // - 削除: planeMap にあって detected にない → scene.remove, disposeGeometries, delete
-    // - 新規: createPlaneObject(polygonToXZ(plane.polygon), orientationKey(plane.orientation), this.materials)
-    //         group.matrixAutoUpdate = false; scene.add(group)
-    // - 更新: plane.lastChangedTime > rec.lastChangedTime → updatePlaneGeometry(rec, ...)
-    // - 姿勢: pose = frame.getPose(plane.planeSpace, this.refSpace)
-    //         pose があれば group.matrix.fromArray(pose.transform.matrix)
-    // - 件数が変わったら onStats(this.#stats())
-    // - renderer.render(this.scene, this.camera)
-    void time; void frame;
+    void time; // 経過時間は今は使わない
+    // setAnimationLoop は XR 以外のときも呼ばれうる。その場合 frame は undefined なので何もしない
+    if (!frame || !this.refSpace) return;
+
+    // ---- A. トラッキング状態 ----
+    // getViewerPose(refSpace)：「refSpace の座標系で見て、いま端末（目）はどこにあるか」。
+    // 端末が自分の位置を見失う（暗い・白い壁だけ・速く振りすぎ）と null になる。
+    const viewerPose = frame.getViewerPose(this.refSpace);
+    const lost = viewerPose === null;
+    if (lost !== this.trackingLost) {
+      this.trackingLost = lost;
+      this.onTracking(lost); // DOM 更新は状態が変わったときだけ
+    }
+
+    // ---- B. 平面の差分更新 ----
+    // detectedPlanes は「このフレームで存在する平面すべて」の集合（差分ではない）。
+    // 同じ平面はフレームをまたいでも同じ XRPlane オブジェクトなので、Map のキーにできる。
+    // plane-detection が有効でなければ undefined なので空集合として扱う。
+    /** @type {Set<XRPlane>} */
+    const detected = frame.detectedPlanes ?? new Set();
+    let countChanged = false;
+
+    // B-1. 削除：前フレームまであったのに、今回の集合にないもの
+    //      （ARCore が近くの平面を1枚に統合したときなどに起きる）
+    for (const [plane, rec] of this.planeMap) {
+      if (!detected.has(plane)) {
+        this.scene.remove(rec.group);
+        disposeGeometries(rec.group); // GPU 上の頂点バッファを解放。マテリアルは共有なので残す
+        this.planeMap.delete(plane);  // Map は反復中の delete が安全
+        countChanged = true;
+      }
+    }
+
+    for (const plane of detected) {
+      let rec = this.planeMap.get(plane);
+
+      if (!rec) {
+        // B-2. 新規：初めて見る平面 → メッシュを作って登録
+        const pts = polygonToXZ(plane.polygon);
+        if (pts.length < 3) continue; // まだ多角形になっていない。次フレームで再挑戦
+        const orientation = orientationKey(plane.orientation);
+        const obj = createPlaneObject(pts, orientation, this.materials);
+        // 位置・向きは XR から 4x4 行列で直接もらうので、three.js に
+        // position/quaternion/scale から matrix を作り直させない（上書きされて原点に戻るのを防ぐ）
+        obj.group.matrixAutoUpdate = false;
+        this.scene.add(obj.group);
+        rec = { ...obj, orientation, lastChangedTime: plane.lastChangedTime };
+        this.planeMap.set(plane, rec);
+        countChanged = true;
+      } else if (plane.lastChangedTime > rec.lastChangedTime) {
+        // B-3. 更新：形（polygon）が変わった平面だけジオメトリを作り直す。
+        //      lastChangedTime は polygon（や姿勢）が変わったときだけ進むので、
+        //      毎フレーム作り直すより圧倒的に軽い
+        const pts = polygonToXZ(plane.polygon);
+        if (pts.length >= 3) updatePlaneGeometry(rec, pts);
+        rec.lastChangedTime = plane.lastChangedTime;
+      }
+
+      // B-4. 姿勢：毎フレーム反映する。
+      //      polygon は「平面自身の座標系（planeSpace）」での形。それが refSpace のどこに
+      //      どの向きで置かれているかを getPose で聞き、その行列を group にそのまま入れる。
+      //      → 形（geometry）と配置（matrix）が分かれているので、位置補正だけなら
+      //        ジオメトリを作り直さなくて済む
+      const pose = frame.getPose(plane.planeSpace, this.refSpace);
+      if (pose) {
+        rec.group.matrix.fromArray(pose.transform.matrix); // 列優先 16 要素 = three.js と同じ並び
+        // matrixAutoUpdate=false のときは、matrixWorld の再計算をこちらから頼む必要がある
+        rec.group.matrixWorldNeedsUpdate = true;
+      }
+      // pose が null（一時的に見失った）なら最後の姿勢のまま表示しておく
+    }
+
+    // ---- C. HUD 統計：件数が変わったフレームだけ通知 ----
+    if (countChanged) this.onStats(this.#stats());
+
+    // ---- D. 描画 ----
+    // camera の姿勢・投影は renderer.xr が XR の値で上書きしてくれる
+    this.renderer.render(this.scene, this.camera);
   }
 
   /** @returns {PlaneStats} */
