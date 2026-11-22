@@ -3,7 +3,9 @@
 WebXR `plane-detection` で検出した平面をARで半透明表示し、セッション終了後に環境地図として
 3Dプレビュー・`.glb` / `.obj` 書き出しする学習用サンプル。ビルド不要（ES Modules + Import Map）。
 
-設計の詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照。
+- 元仕様：[docs/SPEC.md](docs/SPEC.md)
+- 確定設計：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- 開発の経緯・現在地・次の作業：[CLAUDE.md](CLAUDE.md)（Claude Code で開くと自動で読み込まれる）
 
 ## 進捗
 
